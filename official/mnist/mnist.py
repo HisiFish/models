@@ -17,213 +17,227 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import argparse
-import os
-import sys
+from absl import app as absl_app
+from absl import flags
+import tensorflow as tf  # pylint: disable=g-bad-import-order
 
-import tensorflow as tf
-from tensorflow.examples.tutorials.mnist import input_data
-
-parser = argparse.ArgumentParser()
-
-# Basic model parameters.
-parser.add_argument(
-    '--batch_size',
-    type=int,
-    default=100,
-    help='Number of images to process in a batch')
-
-parser.add_argument(
-    '--data_dir',
-    type=str,
-    default='/tmp/mnist_data',
-    help='Path to directory containing the MNIST dataset')
-
-parser.add_argument(
-    '--model_dir',
-    type=str,
-    default='/tmp/mnist_model',
-    help='The directory where the model will be stored.')
-
-parser.add_argument(
-    '--train_epochs', type=int, default=40, help='Number of epochs to train.')
-
-parser.add_argument(
-    '--data_format',
-    type=str,
-    default=None,
-    choices=['channels_first', 'channels_last'],
-    help='A flag to override the data format used in the model. channels_first '
-    'provides a performance boost on GPU but is not always compatible '
-    'with CPU. If left unspecified, the data format will be chosen '
-    'automatically based on whether TensorFlow was built for CPU or GPU.')
+from official.mnist import dataset
+from official.utils.flags import core as flags_core
+from official.utils.logs import hooks_helper
+from official.utils.misc import distribution_utils
+from official.utils.misc import model_helpers
 
 
-def train_dataset(data_dir):
-  """Returns a tf.data.Dataset yielding (image, label) pairs for training."""
-  data = input_data.read_data_sets(data_dir, one_hot=True).train
-  return tf.data.Dataset.from_tensor_slices((data.images, data.labels))
+LEARNING_RATE = 1e-4
 
 
-def eval_dataset(data_dir):
-  """Returns a tf.data.Dataset yielding (image, label) pairs for evaluation."""
-  data = input_data.read_data_sets(data_dir, one_hot=True).test
-  return tf.data.Dataset.from_tensors((data.images, data.labels))
+def create_model(data_format):
+  """Model to recognize digits in the MNIST dataset.
 
+  Network structure is equivalent to:
+  https://github.com/tensorflow/tensorflow/blob/r1.5/tensorflow/examples/tutorials/mnist/mnist_deep.py
+  and
+  https://github.com/tensorflow/models/blob/master/tutorials/image/mnist/convolutional.py
 
-def mnist_model(inputs, mode, data_format):
-  """Takes the MNIST inputs and mode and outputs a tensor of logits."""
-  # Input Layer
-  # Reshape X to 4-D tensor: [batch_size, width, height, channels]
-  # MNIST images are 28x28 pixels, and have one color channel
-  inputs = tf.reshape(inputs, [-1, 28, 28, 1])
+  But uses the tf.keras API.
 
-  if data_format is None:
-    # When running on GPU, transpose the data from channels_last (NHWC) to
-    # channels_first (NCHW) to improve performance.
-    # See https://www.tensorflow.org/performance/performance_guide#data_formats
-    data_format = ('channels_first'
-                   if tf.test.is_built_with_cuda() else 'channels_last')
+  Args:
+    data_format: Either 'channels_first' or 'channels_last'. 'channels_first' is
+      typically faster on GPUs while 'channels_last' is typically faster on
+      CPUs. See
+      https://www.tensorflow.org/performance/performance_guide#data_formats
 
+  Returns:
+    A tf.keras.Model.
+  """
   if data_format == 'channels_first':
-    inputs = tf.transpose(inputs, [0, 3, 1, 2])
+    input_shape = [1, 28, 28]
+  else:
+    assert data_format == 'channels_last'
+    input_shape = [28, 28, 1]
 
-  # Convolutional Layer #1
-  # Computes 32 features using a 5x5 filter with ReLU activation.
-  # Padding is added to preserve width and height.
-  # Input Tensor Shape: [batch_size, 28, 28, 1]
-  # Output Tensor Shape: [batch_size, 28, 28, 32]
-  conv1 = tf.layers.conv2d(
-      inputs=inputs,
-      filters=32,
-      kernel_size=[5, 5],
-      padding='same',
-      activation=tf.nn.relu,
-      data_format=data_format)
-
-  # Pooling Layer #1
-  # First max pooling layer with a 2x2 filter and stride of 2
-  # Input Tensor Shape: [batch_size, 28, 28, 32]
-  # Output Tensor Shape: [batch_size, 14, 14, 32]
-  pool1 = tf.layers.max_pooling2d(
-      inputs=conv1, pool_size=[2, 2], strides=2, data_format=data_format)
-
-  # Convolutional Layer #2
-  # Computes 64 features using a 5x5 filter.
-  # Padding is added to preserve width and height.
-  # Input Tensor Shape: [batch_size, 14, 14, 32]
-  # Output Tensor Shape: [batch_size, 14, 14, 64]
-  conv2 = tf.layers.conv2d(
-      inputs=pool1,
-      filters=64,
-      kernel_size=[5, 5],
-      padding='same',
-      activation=tf.nn.relu,
-      data_format=data_format)
-
-  # Pooling Layer #2
-  # Second max pooling layer with a 2x2 filter and stride of 2
-  # Input Tensor Shape: [batch_size, 14, 14, 64]
-  # Output Tensor Shape: [batch_size, 7, 7, 64]
-  pool2 = tf.layers.max_pooling2d(
-      inputs=conv2, pool_size=[2, 2], strides=2, data_format=data_format)
-
-  # Flatten tensor into a batch of vectors
-  # Input Tensor Shape: [batch_size, 7, 7, 64]
-  # Output Tensor Shape: [batch_size, 7 * 7 * 64]
-  pool2_flat = tf.reshape(pool2, [-1, 7 * 7 * 64])
-
-  # Dense Layer
-  # Densely connected layer with 1024 neurons
-  # Input Tensor Shape: [batch_size, 7 * 7 * 64]
-  # Output Tensor Shape: [batch_size, 1024]
-  dense = tf.layers.dense(inputs=pool2_flat, units=1024, activation=tf.nn.relu)
-
-  # Add dropout operation; 0.6 probability that element will be kept
-  dropout = tf.layers.dropout(
-      inputs=dense, rate=0.4, training=(mode == tf.estimator.ModeKeys.TRAIN))
-
-  # Logits layer
-  # Input Tensor Shape: [batch_size, 1024]
-  # Output Tensor Shape: [batch_size, 10]
-  logits = tf.layers.dense(inputs=dropout, units=10)
-  return logits
+  l = tf.keras.layers
+  max_pool = l.MaxPooling2D(
+      (2, 2), (2, 2), padding='same', data_format=data_format)
+  # The model consists of a sequential chain of layers, so tf.keras.Sequential
+  # (a subclass of tf.keras.Model) makes for a compact description.
+  return tf.keras.Sequential(
+      [
+          l.Reshape(
+              target_shape=input_shape,
+              input_shape=(28 * 28,)),
+          l.Conv2D(
+              32,
+              5,
+              padding='same',
+              data_format=data_format,
+              activation=tf.nn.relu),
+          max_pool,
+          l.Conv2D(
+              64,
+              5,
+              padding='same',
+              data_format=data_format,
+              activation=tf.nn.relu),
+          max_pool,
+          l.Flatten(),
+          l.Dense(1024, activation=tf.nn.relu),
+          l.Dropout(0.4),
+          l.Dense(10)
+      ])
 
 
-def mnist_model_fn(features, labels, mode, params):
-  """Model function for MNIST."""
-  logits = mnist_model(features, mode, params['data_format'])
+def define_mnist_flags():
+  flags_core.define_base()
+  flags_core.define_image()
+  flags.adopt_module_key_flags(flags_core)
+  flags_core.set_defaults(data_dir='/tmp/mnist_data',
+                          model_dir='/tmp/mnist_model',
+                          batch_size=100,
+                          train_epochs=40)
 
-  predictions = {
-      'classes': tf.argmax(input=logits, axis=1),
-      'probabilities': tf.nn.softmax(logits, name='softmax_tensor')
-  }
+
+def model_fn(features, labels, mode, params):
+  """The model_fn argument for creating an Estimator."""
+  model = create_model(params['data_format'])
+  image = features
+  if isinstance(image, dict):
+    image = features['image']
 
   if mode == tf.estimator.ModeKeys.PREDICT:
-    return tf.estimator.EstimatorSpec(mode=mode, predictions=predictions)
-
-  loss = tf.losses.softmax_cross_entropy(onehot_labels=labels, logits=logits)
-
-  # Configure the training op
+    logits = model(image, training=False)
+    predictions = {
+        'classes': tf.argmax(logits, axis=1),
+        'probabilities': tf.nn.softmax(logits),
+    }
+    return tf.estimator.EstimatorSpec(
+        mode=tf.estimator.ModeKeys.PREDICT,
+        predictions=predictions,
+        export_outputs={
+            'classify': tf.estimator.export.PredictOutput(predictions)
+        })
   if mode == tf.estimator.ModeKeys.TRAIN:
-    optimizer = tf.train.AdamOptimizer(learning_rate=1e-4)
-    train_op = optimizer.minimize(loss, tf.train.get_or_create_global_step())
-  else:
-    train_op = None
+    optimizer = tf.train.AdamOptimizer(learning_rate=LEARNING_RATE)
 
-  accuracy = tf.metrics.accuracy(
-      tf.argmax(labels, axis=1), predictions['classes'])
-  metrics = {'accuracy': accuracy}
+    # If we are running multi-GPU, we need to wrap the optimizer.
+    if params.get('multi_gpu'):
+      optimizer = tf.contrib.estimator.TowerOptimizer(optimizer)
 
-  # Create a tensor named train_accuracy for logging purposes
-  tf.identity(accuracy[1], name='train_accuracy')
-  tf.summary.scalar('train_accuracy', accuracy[1])
+    logits = model(image, training=True)
+    loss = tf.losses.sparse_softmax_cross_entropy(labels=labels, logits=logits)
+    accuracy = tf.metrics.accuracy(
+        labels=labels, predictions=tf.argmax(logits, axis=1))
 
-  return tf.estimator.EstimatorSpec(
-      mode=mode,
-      predictions=predictions,
-      loss=loss,
-      train_op=train_op,
-      eval_metric_ops=metrics)
+    # Name tensors to be logged with LoggingTensorHook.
+    tf.identity(LEARNING_RATE, 'learning_rate')
+    tf.identity(loss, 'cross_entropy')
+    tf.identity(accuracy[1], name='train_accuracy')
+
+    # Save accuracy scalar to Tensorboard output.
+    tf.summary.scalar('train_accuracy', accuracy[1])
+
+    return tf.estimator.EstimatorSpec(
+        mode=tf.estimator.ModeKeys.TRAIN,
+        loss=loss,
+        train_op=optimizer.minimize(loss, tf.train.get_or_create_global_step()))
+  if mode == tf.estimator.ModeKeys.EVAL:
+    logits = model(image, training=False)
+    loss = tf.losses.sparse_softmax_cross_entropy(labels=labels, logits=logits)
+    return tf.estimator.EstimatorSpec(
+        mode=tf.estimator.ModeKeys.EVAL,
+        loss=loss,
+        eval_metric_ops={
+            'accuracy':
+                tf.metrics.accuracy(
+                    labels=labels, predictions=tf.argmax(logits, axis=1)),
+        })
 
 
-def main(unused_argv):
-  # Create the Estimator
+def run_mnist(flags_obj):
+  """Run MNIST training and eval loop.
+
+  Args:
+    flags_obj: An object containing parsed flag values.
+  """
+  model_helpers.apply_clean(flags_obj)
+  model_function = model_fn
+
+  # Get number of GPUs as defined by the --num_gpus flags and the number of
+  # GPUs available on the machine.
+  num_gpus = flags_core.get_num_gpus(flags_obj)
+  multi_gpu = num_gpus > 1
+
+  if multi_gpu:
+    # Validate that the batch size can be split into devices.
+    distribution_utils.per_device_batch_size(flags_obj.batch_size, num_gpus)
+
+    # There are two steps required if using multi-GPU: (1) wrap the model_fn,
+    # and (2) wrap the optimizer. The first happens here, and (2) happens
+    # in the model_fn itself when the optimizer is defined.
+    model_function = tf.contrib.estimator.replicate_model_fn(
+        model_fn, loss_reduction=tf.losses.Reduction.MEAN,
+        devices=["/device:GPU:%d" % d for d in range(num_gpus)])
+
+  data_format = flags_obj.data_format
+  if data_format is None:
+    data_format = ('channels_first'
+                   if tf.test.is_built_with_cuda() else 'channels_last')
   mnist_classifier = tf.estimator.Estimator(
-      model_fn=mnist_model_fn,
-      model_dir=FLAGS.model_dir,
+      model_fn=model_function,
+      model_dir=flags_obj.model_dir,
       params={
-          'data_format': FLAGS.data_format
+          'data_format': data_format,
+          'multi_gpu': multi_gpu
       })
 
-  # Set up training hook that logs the training accuracy every 100 steps.
-  tensors_to_log = {'train_accuracy': 'train_accuracy'}
-  logging_hook = tf.train.LoggingTensorHook(
-      tensors=tensors_to_log, every_n_iter=100)
-
-  # Train the model
+  # Set up training and evaluation input functions.
   def train_input_fn():
+    """Prepare data for training."""
+
     # When choosing shuffle buffer sizes, larger sizes result in better
     # randomness, while smaller sizes use less memory. MNIST is a small
     # enough dataset that we can easily shuffle the full epoch.
-    dataset = train_dataset(FLAGS.data_dir)
-    dataset = dataset.shuffle(buffer_size=50000).batch(FLAGS.batch_size).repeat(
-        FLAGS.train_epochs)
-    (images, labels) = dataset.make_one_shot_iterator().get_next()
-    return (images, labels)
+    ds = dataset.train(flags_obj.data_dir)
+    ds = ds.cache().shuffle(buffer_size=50000).batch(flags_obj.batch_size)
 
-  mnist_classifier.train(input_fn=train_input_fn, hooks=[logging_hook])
+    # Iterate through the dataset a set number (`epochs_between_evals`) of times
+    # during each training session.
+    ds = ds.repeat(flags_obj.epochs_between_evals)
+    return ds
 
-  # Evaluate the model and print results
   def eval_input_fn():
-    return eval_dataset(FLAGS.data_dir).make_one_shot_iterator().get_next()
+    return dataset.test(flags_obj.data_dir).batch(
+        flags_obj.batch_size).make_one_shot_iterator().get_next()
 
-  eval_results = mnist_classifier.evaluate(input_fn=eval_input_fn)
-  print()
-  print('Evaluation results:\n\t%s' % eval_results)
+  # Set up hook that outputs training logs every 100 steps.
+  train_hooks = hooks_helper.get_train_hooks(
+      flags_obj.hooks, model_dir=flags_obj.model_dir,
+      batch_size=flags_obj.batch_size)
+
+  # Train and evaluate model.
+  for _ in range(flags_obj.train_epochs // flags_obj.epochs_between_evals):
+    mnist_classifier.train(input_fn=train_input_fn, hooks=train_hooks)
+    eval_results = mnist_classifier.evaluate(input_fn=eval_input_fn)
+    print('\nEvaluation results:\n\t%s\n' % eval_results)
+
+    if model_helpers.past_stop_threshold(flags_obj.stop_threshold,
+                                         eval_results['accuracy']):
+      break
+
+  # Export the model
+  if flags_obj.export_dir is not None:
+    image = tf.placeholder(tf.float32, [None, 28, 28])
+    input_fn = tf.estimator.export.build_raw_serving_input_receiver_fn({
+        'image': image,
+    })
+    mnist_classifier.export_savedmodel(flags_obj.export_dir, input_fn)
+
+
+def main(_):
+  run_mnist(flags.FLAGS)
 
 
 if __name__ == '__main__':
   tf.logging.set_verbosity(tf.logging.INFO)
-  FLAGS, unparsed = parser.parse_known_args()
-  tf.app.run(main=main, argv=[sys.argv[0]] + unparsed)
+  define_mnist_flags()
+  absl_app.run(main)
