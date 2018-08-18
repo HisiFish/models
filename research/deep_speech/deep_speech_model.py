@@ -127,6 +127,56 @@ def _rnn_layer(inputs, rnn_cell, rnn_hidden_size, layer_id, is_batch_norm,
   return rnn_outputs
 
 
+def _cudnn_rnn_layer(inputs, rnn_type, rnn_hidden_size, layer_id, is_batch_norm,
+               is_bidirectional, training):
+  """Defines a batch normalization + rnn layer.
+
+  Args:
+    inputs: input tensors for the current layer.
+    rnn_cell: RNN cell instance to use.
+    rnn_hidden_size: an integer for the dimensionality of the rnn output space.
+    layer_id: an integer for the index of current layer.
+    is_batch_norm: a boolean specifying whether to perform batch normalization
+      on input states.
+    is_bidirectional: a boolean specifying whether the rnn layer is
+      bi-directional.
+    training: a boolean to indicate which stage we are in (training/eval).
+
+  Returns:
+    tensor output for the current layer.
+  """
+  if is_batch_norm:
+    inputs = batch_norm(inputs, training)
+
+  direction = 'unidirectional'
+  if is_bidirectional:
+      direction = 'bidirectional'
+
+  saver = False
+  if saver:
+      RNN_LAYERS = {
+          'gru': tf.contrib.cudnn_rnn.CudnnGRUSaveable,
+          'lstm': tf.contrib.cudnn_rnn.CudnnLSTMSaveable,
+          'rnn': tf.contrib.cudnn_rnn.CudnnRNNTanhSaveable,
+      }
+      rnn_layer = RNN_LAYERS[rnn_type](1, rnn_hidden_size, direction = direction,
+                                                    input_mode = 'linear_input',
+                                                    name = "{}_{}".format(rnn_type, layer_id))
+  else:
+      RNN_LAYERS = {
+          'gru': tf.contrib.cudnn_rnn.CudnnGRU,
+          'lstm': tf.contrib.cudnn_rnn.CudnnLSTM,
+          'rnn': tf.contrib.cudnn_rnn.CudnnRNNTanh,
+      }
+
+      rnn_layer = RNN_LAYERS[rnn_type](1, rnn_hidden_size, direction = direction,
+                                                    input_mode = 'linear_input',
+                                                    dtype = tf.float32,
+                                                    name = "{}_{}".format(rnn_type, layer_id))
+  rnn_outputs,_ = rnn_layer(inputs)
+  return rnn_outputs
+
+
 class DeepSpeech2(object):
   """Define DeepSpeech2 model."""
 
@@ -148,6 +198,7 @@ class DeepSpeech2(object):
     self.rnn_hidden_size = rnn_hidden_size
     self.num_classes = num_classes
     self.use_bias = use_bias
+    self.use_cudnn_rnn = use_cudnn_rnn
 
   def __call__(self, inputs, training):
     # Two cnn layers.
@@ -169,13 +220,21 @@ class DeepSpeech2(object):
         [batch_size, -1, feat_size * _CONV_FILTERS])
 
     # RNN layers.
-    rnn_cell = SUPPORTED_RNNS[self.rnn_type]
-    for layer_counter in xrange(self.num_rnn_layers):
-      # No batch normalization on the first layer.
-      is_batch_norm = (layer_counter != 0)
-      inputs = _rnn_layer(
-          inputs, rnn_cell, self.rnn_hidden_size, layer_counter + 1,
-          is_batch_norm, self.is_bidirectional, training)
+    if self.use_cudnn_rnn:
+        for layer_counter in xrange(self.num_rnn_layers):
+          # No batch normalization on the first layer.
+          is_batch_norm = (layer_counter != 0)
+          inputs = _cudnn_rnn_layer(
+              inputs, self.rnn_type, self.rnn_hidden_size, layer_counter + 1,
+              is_batch_norm, self.is_bidirectional, training)
+    else:
+        rnn_cell = SUPPORTED_RNNS[self.rnn_type]
+        for layer_counter in xrange(self.num_rnn_layers):
+          # No batch normalization on the first layer.
+          is_batch_norm = (layer_counter != 0)
+          inputs = _rnn_layer(
+              inputs, rnn_cell, self.rnn_hidden_size, layer_counter + 1,
+              is_batch_norm, self.is_bidirectional, training)
 
     # FC layer with batch norm.
     inputs = batch_norm(inputs, training)
