@@ -159,7 +159,7 @@ def model_fn(features, labels, mode, params):
   model = deep_speech_model.DeepSpeech2(
       flags_obj.rnn_hidden_layers, flags_obj.rnn_type,
       flags_obj.is_bidirectional, flags_obj.rnn_hidden_size,
-      num_classes, flags_obj.use_bias)
+      num_classes, flags_obj.use_bias, flags_obj.use_cudnn_rnn)
 
   if mode == tf.estimator.ModeKeys.PREDICT:
     logits = model(features, training=False)
@@ -383,6 +383,10 @@ def define_deep_speech_flags():
       enum_values=deep_speech_model.SUPPORTED_RNNS.keys(),
       case_sensitive=False,
       help=flags_core.help_wrap("Type of RNN cell."))
+
+  flags.DEFINE_bool(
+      name="use_cudnn_rnn", default=True,
+      help=flags_core.help_wrap("Use cudnn implemented RNN"))
 
   # Training related flags
   flags.DEFINE_float(
